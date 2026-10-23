@@ -1,0 +1,129 @@
+name: 일별 데이터 갱신
+
+# 백테스트 계산기 일별 데이터 (주요 종목만). 코드는 main, 데이터는 gh-pages 브랜치에 둔다.
+# gh-pages 는 기록을 남기지 않고 매번 커밋 하나로 덮어쓴다(force push) — 저장소가 커지지 않게.
+#
+#   국내  평일 19:27 KST   다음·네이버 최근 20일 + 세이브로 배당(portfolio-sheet-data 18:47 갱신분) + 환율
+#   미국  화~토 07:47 KST  야후 최근 20일(배당·분할 포함) + 환율
+#   전체  일   04:17 KST   모든 종목 처음부터 다시 받기 + 검증(월별 자료와 대조)
+#   선정  1·4·7·10월 3일 11:37 KST  대상 종목 다시 고르기 (portfolio-sheet-data KRX 월말 갱신 뒤)
+# ★ 분(分)은 :00 을 피한다. cron 은 UTC.
+on:
+  schedule:
+    - cron: "27 10 * * 1-5"
+    - cron: "47 22 * * 1-5"
+    - cron: "17 19 * * 6"
+    - cron: "37 2 3 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "kr / us / full / select"
+        required: false
+        default: "full"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: daily-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SITE: site
+      PSD: psd
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 지금 데이터 (gh-pages)
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+
+      - name: 할 일 정하기
+        id: mode
+        run: |
+          case "${{ github.event.schedule }}" in
+            "27 10 * * 1-5")     m=kr ;;
+            "47 22 * * 1-5")     m=us ;;
+            "17 19 * * 6")       m=full ;;
+            "37 2 3 1,4,7,10 *") m=select ;;
+            *)                   m="${{ github.event.inputs.mode || 'full' }}" ;;
+          esac
+          echo "mode=$m" >> "$GITHUB_OUTPUT"
+          echo "할 일: $m"
+
+      # 필요한 폴더만 받는다. data/·data/history/ 바로 아래 파일(배당·종목 목록)은 cone 모드라 항상 들어온다.
+      #   kr_stock·kr_stock_krx  국내 주식 배당 단위 맞추기 · krx_*_month  선정 · kr_etf_krx·us·bt/div  검증
+      - name: portfolio-sheet-data (매일)
+        if: steps.mode.outputs.mode == 'kr' || steps.mode.outputs.mode == 'us'
+        uses: actions/checkout@v4
+        with:
+          repository: ttokjaeTV/portfolio-sheet-data
+          path: psd
+          filter: blob:none
+          sparse-checkout: |
+            data/history/kr_stock_krx
+            data/history/kr_stock
+
+      - name: portfolio-sheet-data (전체·선정)
+        if: steps.mode.outputs.mode == 'full' || steps.mode.outputs.mode == 'select'
+        uses: actions/checkout@v4
+        with:
+          repository: ttokjaeTV/portfolio-sheet-data
+          path: psd
+          filter: blob:none
+          sparse-checkout: |
+            data/history/kr_stock_krx
+            data/history/kr_stock
+            data/history/krx_etf_month
+            data/history/krx_stock_month
+            data/history/kr_etf_krx
+            data/history/us
+            data/bt/div
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 대상 종목 다시 고르기
+        if: steps.mode.outputs.mode == 'select'
+        run: python scripts/select_universe.py
+
+      - name: 갱신
+        run: |
+          case "${{ steps.mode.outputs.mode }}" in
+            kr)     python scripts/build_daily.py inc K fx div index ;;
+            us)     python scripts/build_daily.py inc U fx index ;;
+            full)   python scripts/build_daily.py full K U fx div index ;;
+            select) python scripts/build_daily.py inc K U fx div index ;;
+          esac
+
+      - name: 검증 (월별 자료와 대조)
+        if: steps.mode.outputs.mode == 'full' || steps.mode.outputs.mode == 'select'
+        run: python scripts/verify.py
+
+      - name: gh-pages 덮어쓰기
+        working-directory: site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q --orphan next
+          git add -A
+          git commit -q -m "일별 데이터 $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M') (${{ steps.mode.outputs.mode }})"
+          git push -q -f origin next:gh-pages
+
+      - name: 실패 알림
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '일별 데이터 갱신 실패 (%s)\n\n%s\n' "${{ steps.mode.outputs.mode }}" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > body.md
+          gh issue create --title "일별 데이터 갱신 실패 $(TZ=Asia/Seoul date '+%Y-%m-%d')" --body-file body.md
